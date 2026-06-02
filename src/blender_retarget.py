@@ -27,6 +27,20 @@ import numpy as np
 import torch
 
 PROJECT_ROOT   = Path(__file__).parent.parent
+
+# Cache des poses de repos natives par model (pour propagation des os manquants)
+_rest_bone_poses_cache: dict = {}
+
+
+def _get_rest_bone_poses(model) -> np.ndarray:
+    """Retourne les rest_bone_poses (monde) d'Anny, en cache par instance model."""
+    key = id(model)
+    if key not in _rest_bone_poses_cache:
+        identity = {label: torch.eye(4).unsqueeze(0) for label in model.bone_labels}
+        with torch.no_grad():
+            out = model(pose_parameters=identity, pose_parameterization="rest_relative")
+        _rest_bone_poses_cache[key] = out["rest_bone_poses"].squeeze(0).cpu().numpy()
+    return _rest_bone_poses_cache[key]
 BLEND_FILE     = PROJECT_ROOT / "blender" / "anny_armature.blend"
 EXPORT_SCRIPT  = PROJECT_ROOT / "blender" / "retarget_export.py"
 OUTPUT_DIR     = PROJECT_ROOT / "output" / "retarget_cache"
@@ -153,12 +167,35 @@ def params_from_frame(
 ) -> dict[str, torch.Tensor]:
     """
     Convertit un frame_data Blender → pose_params Anny (mode "absolute").
-    Les os absents gardent la matrice identité (pose de repos native).
+
+    Les os absents du JSON (ex: breast.L/R supprimés de Blender) héritent de la
+    déformation de leur parent plutôt que de rester à l'identité.
+    Formule : M_bone = M_parent_anim @ inv(M_parent_rest) @ M_bone_rest
+    → deform_bone = deform_parent : le breast suit le thorax sans rotation propre.
     """
+    rest = _get_rest_bone_poses(model)
     params: dict[str, torch.Tensor] = {}
-    for label in model.bone_labels:
-        M = frame_data.get(label, np.eye(4, dtype=np.float32))
-        params[label] = torch.from_numpy(M.copy()).float().unsqueeze(0)
+    M_array: dict[str, np.ndarray] = {}
+
+    for i, label in enumerate(model.bone_labels):
+        if label in frame_data:
+            M = frame_data[label]
+        else:
+            parent_idx = int(model.bone_parents[i])
+            if parent_idx >= 0:
+                parent_label = model.bone_labels[parent_idx]
+                M_parent = M_array.get(parent_label)
+                if M_parent is not None:
+                    # même déformation que le parent + offset local T-pose
+                    M = M_parent @ np.linalg.inv(rest[parent_idx]) @ rest[i]
+                else:
+                    M = rest[i]
+            else:
+                M = rest[i]
+
+        M = M.astype(np.float32)
+        M_array[label] = M
+        params[label] = torch.from_numpy(M).float().unsqueeze(0)
     return params
 
 
@@ -268,79 +305,145 @@ def main():
         _make_gif(retarget_data, frames_available, model, bvh_path, args)
 
 
+# ── Helpers projection multi-vues ─────────────────────────────────────────────
+
+# Angles de caméra : (theta_deg, label)
+# theta=0 → face (-Y), theta négatif → tourne vers la droite de l'écran
+_GIF_VIEWS = [
+    (  0,  "Face"),
+    (-50,  "¾ avant"),
+    (130,  "¾ arrière"),
+]
+
+
+def _rotate_verts_z(verts: np.ndarray, theta_deg: float) -> np.ndarray:
+    """
+    Tourne les vertices de theta_deg autour de Z pour simuler la caméra
+    à cet angle depuis l'avant (-Y).  theta=0 → vue de face inchangée.
+    Après rotation, draw_mesh_shaded projette correctement (culling ny<0, proj XZ).
+    """
+    if theta_deg == 0:
+        return verts
+    rad = np.radians(theta_deg)
+    c, s = np.cos(rad), np.sin(rad)
+    return np.column_stack([
+        c * verts[:, 0] + s * verts[:, 1],
+        -s * verts[:, 0] + c * verts[:, 1],
+        verts[:, 2],
+    ])
+
+
+def _project_joints_angle(positions: dict, theta_deg: float) -> dict:
+    """Projette les joints 3D → 2D (u=horizontal, v=Z) pour l'angle theta_deg."""
+    rad = np.radians(theta_deg)
+    c, s = np.cos(rad), np.sin(rad)
+    return {
+        name: np.array([c * p[0] + s * p[1], p[2]])
+        for name, p in positions.items()
+    }
+
+
 def _make_gif(retarget_data, frames_available, model, bvh_path, args):
-    """Génère un GIF animé mesh Anny + squelette coloré, bounds automatiques."""
+    """
+    Génère un GIF animé 3 vues côte à côte : face, ¾ avant, ¾ arrière.
+    Bounds globaux stables par vue. Qualité haute (dpi=120).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
     from matplotlib.animation import FuncAnimation
     from animate_bvh import _ANNY_LEFT_BONES, _ANNY_RIGHT_BONES, _ANNY_CENTER_BONES
-    from visualize import get_anny_joint_positions, draw_mesh_shaded, _C_LEFT, _C_RIGHT, _C_CENTER
+    from visualize import get_anny_joint_positions, draw_mesh_shaded, _C_LEFT, _C_RIGHT, _C_CENTER, ANNY_DISPLAY_BONES
 
-    faces = model.faces if isinstance(model.faces, np.ndarray) else model.faces.cpu().numpy()
+    faces          = model.faces if isinstance(model.faces, np.ndarray) else model.faces.cpu().numpy()
+    _display_joints = {j for pair in ANNY_DISPLAY_BONES for j in pair}
 
     n = min(args.gif_frames, len(frames_available))
-    indices = np.linspace(0, len(frames_available) - 1, n, dtype=int)
+    indices    = np.linspace(0, len(frames_available) - 1, n, dtype=int)
     frame_list = [frames_available[i] for i in indices]
 
-    print(f"[gif] pré-calcul {len(frame_list)} frames...")
+    print(f"[gif] pré-calcul {len(frame_list)} frames × {len(_GIF_VIEWS)} vues...")
+
+    # Pré-calcul : vertices rotatés + joints projetés par vue
     precomputed = []
-    all_xs, all_zs = [], []
+    view_xs = {theta: [] for theta, _ in _GIF_VIEWS}
+    view_zs = {theta: [] for theta, _ in _GIF_VIEWS}
 
     for i, f in enumerate(frame_list):
         params = retarget_frame_blender(retarget_data, f, model)
         with __import__("torch").no_grad():
             out = model(pose_parameters=params, pose_parameterization="absolute")
-        verts = out["vertices"].squeeze(0).cpu().numpy()
+        verts    = out["vertices"].squeeze(0).cpu().numpy()
         anny_pos = get_anny_joint_positions(out, model)
-        cx = verts[:, 0].mean()
-        anny_2d = {k: np.array([p[0] - cx, p[2]]) for k, p in anny_pos.items()}
-        precomputed.append((verts, anny_2d))
-        # Bounds depuis le mesh (plus précis que les joints)
-        all_xs += list(verts[:, 0] - cx)
-        all_zs += list(verts[:, 2])
+
+        frame_views = {}
+        for theta, _ in _GIF_VIEWS:
+            verts_rot  = _rotate_verts_z(verts, theta)
+            cx         = float(verts_rot[:, 0].mean())
+            joints_2d  = _project_joints_angle(anny_pos, theta)
+            joints_2d  = {k: np.array([p[0] - cx, p[1]]) for k, p in joints_2d.items()}
+            frame_views[theta] = (verts_rot, cx, joints_2d)
+            view_xs[theta].extend(verts_rot[:, 0] - cx)
+            view_zs[theta].extend(verts_rot[:, 2])
+
+        precomputed.append((f, frame_views))
         if (i + 1) % 10 == 0:
             print(f"  {i+1}/{len(frame_list)}")
 
-    pad_x = (max(all_xs) - min(all_xs)) * 0.05 + 0.03
-    pad_z = (max(all_zs) - min(all_zs)) * 0.05 + 0.03
-    xlim = (min(all_xs) - pad_x, max(all_xs) + pad_x)
-    ylim = (min(all_zs) - pad_z, max(all_zs) + pad_z)
+    # Limites stables par vue
+    view_limits = {}
+    for theta, _ in _GIF_VIEWS:
+        xs, zs = view_xs[theta], view_zs[theta]
+        px = (max(xs) - min(xs)) * 0.05 + 0.04
+        pz = (max(zs) - min(zs)) * 0.05 + 0.04
+        view_limits[theta] = (
+            (min(xs) - px, max(xs) + px),
+            (min(zs) - pz, max(zs) + pz),
+        )
 
     BG = "#0d0d1a"
-    fig, ax = plt.subplots(figsize=(5, 8), facecolor=BG)
-    fig.suptitle(f"Blender retarget — {bvh_path.stem}", color="white", fontsize=10)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 7), facecolor=BG)
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.90, bottom=0.01, wspace=0.05)
+    fig.suptitle(f"Blender retarget — {bvh_path.stem}", color="white", fontsize=11)
 
     def update(i):
-        ax.cla()
-        verts, anny_2d = precomputed[i]
-        draw_mesh_shaded(ax, verts, faces)
-        for bones, color in [
-            (_ANNY_LEFT_BONES,   _C_LEFT),
-            (_ANNY_RIGHT_BONES,  _C_RIGHT),
-            (_ANNY_CENTER_BONES, _C_CENTER),
-        ]:
-            segs = [[anny_2d[a], anny_2d[b]] for a, b in bones
-                    if a in anny_2d and b in anny_2d]
-            if segs:
-                ax.add_collection(LineCollection(segs, colors=color, linewidths=1.5))
-        for p in anny_2d.values():
-            ax.scatter(p[0], p[1], c="white", s=6, zorder=5)
-        ax.set_facecolor(BG)
-        ax.set_xlim(*xlim)
-        ax.set_ylim(*ylim)
-        ax.set_aspect("equal")
-        ax.set_title(f"frame {frame_list[i]}", color="white", fontsize=8)
-        ax.axis("off")
+        f, frame_views = precomputed[i]
+        for ax, (theta, label) in zip(axes, _GIF_VIEWS):
+            ax.cla()
+            verts_rot, cx, joints_2d = frame_views[theta]
+
+            draw_mesh_shaded(ax, verts_rot, faces)
+
+            for bones, color in [
+                (_ANNY_LEFT_BONES,   _C_LEFT),
+                (_ANNY_RIGHT_BONES,  _C_RIGHT),
+                (_ANNY_CENTER_BONES, _C_CENTER),
+            ]:
+                segs = [[joints_2d[a], joints_2d[b]] for a, b in bones
+                        if a in joints_2d and b in joints_2d]
+                if segs:
+                    ax.add_collection(LineCollection(segs, colors=color, linewidths=1.8))
+
+            for name, p in joints_2d.items():
+                if name in _display_joints:
+                    ax.scatter(p[0], p[1], c="white", s=8, zorder=5)
+
+            xlim, ylim = view_limits[theta]
+            ax.set_facecolor(BG)
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            ax.set_aspect("equal")
+            ax.set_title(f"{label}  ·  f{f}", color="white", fontsize=9)
+            ax.axis("off")
 
     anim = FuncAnimation(fig, update, frames=len(precomputed),
                          interval=1000 // args.fps, blit=False)
     gif_path = Path(args.out).with_suffix(".gif")
     print(f"[gif] sauvegarde {gif_path}...")
-    anim.save(str(gif_path), writer="pillow", fps=args.fps, dpi=90)
+    anim.save(str(gif_path), writer="pillow", fps=args.fps, dpi=120)
     plt.close(fig)
-    print(f"[gif] sauvegardé : {gif_path}  bounds Z=[{ylim[0]:.2f}, {ylim[1]:.2f}]")
+    print(f"[gif] sauvegardé : {gif_path}")
 
 
 if __name__ == "__main__":

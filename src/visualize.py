@@ -114,14 +114,16 @@ def draw_skeleton(ax, positions_2d: dict[str, np.ndarray], bones: list[tuple],
                   label=None):
     """Dessine un squelette 2D sur un axe matplotlib."""
     segments = []
+    visible = {j for pair in bones for j in pair}
     for a, b in bones:
         if a in positions_2d and b in positions_2d:
             segments.append([positions_2d[a], positions_2d[b]])
     if segments:
         lc = LineCollection(segments, colors=bone_color, linewidths=linewidth, label=label)
         ax.add_collection(lc)
-    xs = [p[0] for p in positions_2d.values()]
-    ys = [p[1] for p in positions_2d.values()]
+    # N'afficher que les joints présents dans la liste d'os (pas les os faciaux)
+    xs = [p[0] for n, p in positions_2d.items() if n in visible]
+    ys = [p[1] for n, p in positions_2d.items() if n in visible]
     ax.scatter(xs, ys, c=joint_color, s=joint_size, zorder=5)
 
 

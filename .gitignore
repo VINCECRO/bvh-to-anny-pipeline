@@ -20,6 +20,9 @@ output/*.png
 output/*.gif
 output/*.jpg
 
+# test folder
+test/
+
 # Données volumineuses non versionnées (gérées via submodules)
 # data/cmu/ et data/anny/ → submodules git
 

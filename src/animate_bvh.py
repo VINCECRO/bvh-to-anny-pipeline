@@ -85,6 +85,7 @@ def _draw_anny_skeleton(ax, pos2d: dict, verts2d=None, faces=None):
             pc = PatchCollection(patches, alpha=0.18, facecolor="lightblue", edgecolor="none")
             ax.add_collection(pc)
 
+    _display_joints = {j for pair in ANNY_DISPLAY_BONES for j in pair}
     for bones, color in [
         (_ANNY_LEFT_BONES,   _C_LEFT),
         (_ANNY_RIGHT_BONES,  _C_RIGHT),
@@ -93,8 +94,10 @@ def _draw_anny_skeleton(ax, pos2d: dict, verts2d=None, faces=None):
         segs = [[pos2d[a], pos2d[b]] for a, b in bones if a in pos2d and b in pos2d]
         if segs:
             ax.add_collection(LineCollection(segs, colors=color, linewidths=2.0, zorder=3))
-    for p in pos2d.values():
-        ax.scatter(p[0], p[1], c="white", s=12, zorder=5)
+    # Uniquement les joints anatomiques (pas les os faciaux)
+    for name, p in pos2d.items():
+        if name in _display_joints:
+            ax.scatter(p[0], p[1], c="white", s=12, zorder=5)
 
 
 def _setup_ax(ax, title: str):
