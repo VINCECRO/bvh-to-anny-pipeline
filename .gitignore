@@ -25,7 +25,8 @@ output/*.jpg
 
 # blender file not committed
 blender/Anny_mesh_BVH_rig.blend
-anny_rest_matrices.json
+blender/anny_rest_matrices.json
+blender/anny_armature.blend1
 
 # Divers
 .DS_Store
