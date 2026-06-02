@@ -28,17 +28,20 @@ import torch
 
 PROJECT_ROOT   = Path(__file__).parent.parent
 
-# Cache des poses de repos natives par model (pour propagation des os manquants)
+# Cache des poses de repos natives par model (phénotype par défaut = aucun kwargs)
 _rest_bone_poses_cache: dict = {}
 
 
 def _get_rest_bone_poses(model) -> np.ndarray:
-    """Retourne les rest_bone_poses (monde) d'Anny, en cache par instance model."""
+    """
+    rest_bone_poses d'Anny au phénotype par défaut (aucun kwargs = corps neutre).
+    Utilisé comme fallback pour la propagation des os absents du JSON (breast.L/R).
+    """
     key = id(model)
     if key not in _rest_bone_poses_cache:
         identity = {label: torch.eye(4).unsqueeze(0) for label in model.bone_labels}
         with torch.no_grad():
-            out = model(pose_parameters=identity, pose_parameterization="rest_relative")
+            out = model(pose_parameters=identity, pose_parameterization="absolute")
         _rest_bone_poses_cache[key] = out["rest_bone_poses"].squeeze(0).cpu().numpy()
     return _rest_bone_poses_cache[key]
 BLEND_FILE     = PROJECT_ROOT / "blender" / "anny_armature.blend"
@@ -168,7 +171,7 @@ def params_from_frame(
     """
     Convertit un frame_data Blender → pose_params Anny (mode "absolute").
 
-    Les os absents du JSON (ex: breast.L/R supprimés de Blender) héritent de la
+    Les os absents du JSON (breast.L/R supprimés de Blender) héritent de la
     déformation de leur parent plutôt que de rester à l'identité.
     Formule : M_bone = M_parent_anim @ inv(M_parent_rest) @ M_bone_rest
     → deform_bone = deform_parent : le breast suit le thorax sans rotation propre.
@@ -186,7 +189,6 @@ def params_from_frame(
                 parent_label = model.bone_labels[parent_idx]
                 M_parent = M_array.get(parent_label)
                 if M_parent is not None:
-                    # même déformation que le parent + offset local T-pose
                     M = M_parent @ np.linalg.inv(rest[parent_idx]) @ rest[i]
                 else:
                     M = rest[i]
