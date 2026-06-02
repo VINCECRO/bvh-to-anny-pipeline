@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Blender temporaires
+*.blend1
+
+# Cache retarget Blender (~26 Mo/fichier)
+output/retarget_cache/
+
+# Outputs générés (images, GIFs)
+output/*.png
+output/*.gif
+output/*.jpg
+
+# Données volumineuses non versionnées (gérées via submodules)
+# data/cmu/ et data/anny/ → submodules git
+
+# blender file not committed
+blender/Anny_mesh_BVH_rig.blend
+anny_rest_matrices.json
+
+# Divers
+.DS_Store
+*.log

@@ -1,0 +1,34 @@
+[project]
+name = "pose-compute-v2-anny-x-cmu"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anny",
+    "bvhio>=1.5.4",
+    "matplotlib>=3.10.9",
+    "numpy>=2.2.6",
+    "pillow>=12.2.0",
+    "roma>=1.5.6",
+    "torch>=2.12.0",
+    "trimesh>=4.12.2",
+    "streamlit==1.57.0",
+    "plotly>=6.1.0",
+    "gradio>=6.15.2",
+    "warp>=1.0.4",
+    "warp-lang>=1.13.0",
+    "jsonargparse>=4.49.0",
+    "pyyaml>=6.0.3",
+    "scipy>=1.15.3",
+    "pyvista[jupyter]>=0.48.4",
+    "stpyvista>=0.2.1",
+]
+
+[tool.uv.workspace]
+members = [
+    "data/anny",
+]
+
+[tool.uv.sources]
+anny = { workspace = true, editable = true }
